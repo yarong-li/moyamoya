@@ -1,0 +1,20 @@
+# 字节码和缓存
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 虚拟环境
+.venv/
+env/
+venv/
+
+# 操作系统文件
+.DS_Store
+
+# 数据和检查点
+data/
+checkpoints/
+
+# 测试脚本
+src/training/test.ipynb
+src/note.ipynb
