@@ -14,6 +14,8 @@ venv/
 # 数据和检查点
 data/
 checkpoints/
+runs/
+training.log
 
 # 测试脚本
 src/training/test.ipynb

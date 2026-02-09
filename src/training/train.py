@@ -12,6 +12,9 @@ from src.data.dataset import MedicalImageDataset
 from src.models.cnn_3d import Basic3DCNN
 from src.training.trainer import Trainer
 
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+
 
 def get_device():
     if torch.cuda.is_available():
@@ -97,26 +100,30 @@ def main():
     seed = 42
     n_splits = 5
 
-    # 小数据：建议训练更久 + early stopping
     max_epochs = 50
     batch_size = 5
     lr = 1e-4
     weight_decay = 1e-2
 
     # early stopping + scheduler
-    patience = 8                  # 连续多少个 epoch 没提升就停
+    use_early_stopping = False
+    patience = 8               
     min_delta = 1e-4              # val loss 至少下降多少才算提升
-    monitor = "val_loss"          # 小数据上建议用 loss 更稳
-    save_by = "val_loss"          # 也用 loss 来选 best ckpt
+    save_by = "val_loss"          # 根据val loss来储存checkpoint
 
     manifest_path = "/data1/yxinwang/yarong/project/src/data/manifest.csv"
     ckpt_root = "checkpoints"
+
+    # Tensor board log root
+    tb_root = "runs"  # tensorboard --logdir runs
+    run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # ====== setup ======
     set_seed(seed)
     device = get_device()
     print("Device:", device)
     os.makedirs(ckpt_root, exist_ok=True)
+    os.makedirs(tb_root, exist_ok=True)
 
     # ====== 1) load manifest ======
     df = pd.read_csv(manifest_path)
@@ -151,6 +158,19 @@ def main():
         train_loader, val_loader = make_loaders(
             train_df, val_df, batch_size=batch_size, num_workers=0
         )
+
+        tb_logdir = os.path.join(tb_root, run_name, f"fold_{fold}")
+
+        # Write to tensorboard
+        writer = SummaryWriter(log_dir=tb_logdir)
+        writer.add_text("meta/hparams",
+                        f"seed={seed}, n_splits={n_splits}, batch_size={batch_size}, "
+                        f"lr={lr}, weight_decay={weight_decay}, max_epochs={max_epochs}, "
+                        f"patience={patience}, min_delta={min_delta}, save_by={save_by}"
+                        f"use_early_stopping={use_early_stopping}",
+                        global_step=0)
+        writer.add_text("data/train_class_counts", str(train_counts), global_step=0)
+        writer.add_text("data/val_class_counts", str(val_counts), global_step=0)
 
         # ====== 3) model/optim/criterion/trainer ======
         model = Basic3DCNN(num_classes=num_classes).to(device)
@@ -195,6 +215,18 @@ def main():
                 f"val loss {va_loss:.4f} acc {va_acc:.4f}"
             )
 
+            # Write to tensorboard
+            if tr_loss is not None:
+                writer.add_scalar("train/loss", float(tr_loss), epoch)
+            if tr_acc is not None:
+                writer.add_scalar("train/acc", float(tr_acc), epoch)
+            if va_loss is not None:
+                writer.add_scalar("val/loss", float(va_loss), epoch)
+            if va_acc is not None:
+                writer.add_scalar("val/acc", float(va_acc), epoch)
+
+            writer.add_scalar("optim/lr", float(cur_lr), epoch)
+
             # scheduler step on val loss
             scheduler.step(va_loss)
 
@@ -218,16 +250,24 @@ def main():
                     },
                     best_path
                 )
+                # Write to tensorboard
+                if save_by == "val_loss":
+                    writer.add_scalar("best/val_loss", float(best_metric), epoch)
+                else:
+                    writer.add_scalar("best/val_acc", float(best_metric), epoch)
             else:
-                no_improve += 1
-                if no_improve >= patience:
-                    print(f"🛑 Early stop at epoch {epoch} (best epoch {best_epoch}, best {save_by}={best_metric:.4f})")
-                    break
+                if use_early_stopping:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        print(f"🛑 Early stop at epoch {epoch} (best epoch {best_epoch}, best {save_by}={best_metric:.4f})")
+                        break
 
         # 用 best checkpoint 的指标汇总（这里保存的是 best_val_loss）
         fold_results.append({"fold": fold, "best_epoch": best_epoch, "best_val_loss": best_metric, "ckpt": best_path})
         print(f"✅ Fold {fold} best at epoch {best_epoch} | best val loss: {best_metric:.4f} | saved: {best_path}")
 
+        # Close tensor board
+        writer.close()
     # ====== 5) summary ======
     print("\n" + "=" * 60)
     losses = [r["best_val_loss"] for r in fold_results]
