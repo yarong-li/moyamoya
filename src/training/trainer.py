@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from sklearn.metrics import balanced_accuracy_score, f1_score
+from sklearn.metrics import balanced_accuracy_score, f1_score, confusion_matrix
+
 
 
 class Trainer:
@@ -12,17 +13,31 @@ class Trainer:
         self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
 
     @staticmethod
-    def _compute_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> dict:
+    def _compute_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int = None) -> dict:
         """
         y_true, y_pred are 1D CPU tensors of shape [N]
         """
         yt = y_true.numpy()
         yp = y_pred.numpy()
-        return {
+        
+        result = {
+            "y_pred": yp,
+            "y_t": yt,
             "acc": float((yp == yt).mean()) if len(yt) > 0 else 0.0,
             "bal_acc": float(balanced_accuracy_score(yt, yp)) if len(yt) > 0 else 0.0,
             "macro_f1": float(f1_score(yt, yp, average="macro")) if len(yt) > 0 else 0.0,
         }
+        
+        # Compute confusion matrix
+        if len(yt) > 0:
+            if num_classes is None:
+                num_classes = int(max(yt.max(), yp.max()) + 1)
+            cm = confusion_matrix(yt, yp, labels=list(range(num_classes)))
+            result["confusion_matrix"] = cm
+        else:
+            result["confusion_matrix"] = None
+            
+        return result
 
     def train_one_epoch(self, loader) -> dict:
         self.model.train()
@@ -52,7 +67,7 @@ class Trainer:
         y_true = torch.cat(all_targets) if all_targets else torch.empty(0, dtype=torch.long)
 
         out = {"loss": total_loss / max(len(y_true), 1)}
-        out.update(self._compute_metrics(y_true, y_pred))
+        out.update(self._compute_metrics(y_true, y_pred, num_classes=self.num_classes))
         return out
 
     @torch.no_grad()
@@ -81,5 +96,5 @@ class Trainer:
         y_true = torch.cat(all_targets) if all_targets else torch.empty(0, dtype=torch.long)
 
         out = {"loss": total_loss / max(len(y_true), 1)}
-        out.update(self._compute_metrics(y_true, y_pred))
+        out.update(self._compute_metrics(y_true, y_pred, num_classes=self.num_classes))
         return out

@@ -18,8 +18,8 @@ class MedicalImageDataset(Dataset):
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 稳健裁剪 + z-score（可选）
-        lo, hi = np.percentile(x, self.clip_percentiles)
-        x = np.clip(x, lo, hi)
+        # lo, hi = np.percentile(x, self.clip_percentiles)
+        # x = np.clip(x, lo, hi)
         x = (x - x.mean()) / (x.std() + 1e-8)
         return x.astype(np.float32, copy=False)
 

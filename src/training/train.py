@@ -4,16 +4,19 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from sklearn.model_selection import StratifiedKFold
 
-from src.data.dataset import MedicalImageDataset
+from src.data_handler.dataset import MedicalImageDataset
 from src.models.cnn_3d import Basic3DCNN
 from src.training.trainer import Trainer
+from src.training.losses import FocalLoss
 
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 def get_device():
@@ -73,8 +76,21 @@ def make_loaders(train_df, val_df, batch_size=2, num_workers=0):
         normalize=True,
     )
 
+    # Sample the data based on label
+    train_labels = train_df["label"].to_numpy().astype(int)
+    class_counts = np.bincount(train_labels, minlength=int(train_labels.max()) + 1)
+    class_weights = 1.0 / np.maximum(class_counts, 1)          # 每类权重 ~ 1/count
+    sample_weights = class_weights[train_labels]               
+
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),   # 每个 epoch 采样次数，在这里保持 epoch 长度不变，如果效果还是不好可以考虑延长epoch长度，这样可以让minority sample更多次
+        replacement=True                   # 允许重复抽一个sample
+    )
+
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds, batch_size=batch_size, 
+        sampler = sampler, shuffle=False,
         num_workers=num_workers, pin_memory=True
     )
     val_loader = DataLoader(
@@ -95,15 +111,50 @@ def _compute_class_weights(train_labels: np.ndarray, num_classes: int) -> torch.
     w = w * (num_classes / w.sum())  # normalize
     return torch.tensor(w, dtype=torch.float32)
 
+
+def plot_confusion_matrix(cm, class_names=None, normalize=False, title='Confusion Matrix'):
+    """
+    Plot confusion matrix as a figure.
+    
+    Args:
+        cm: Confusion matrix (numpy array)
+        class_names: List of class names (optional)
+        normalize: Whether to normalize the confusion matrix
+        title: Title of the plot
+    
+    Returns:
+        matplotlib figure
+    """
+    if normalize:
+        row_sums = cm.sum(axis=1)[:, np.newaxis]
+        row_sums[row_sums == 0] = 1  # Avoid division by zero
+        cm = cm.astype('float') / row_sums
+        fmt = '.2f'
+    else:
+        fmt = 'd'
+    
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt=fmt, cmap='Blues', ax=ax, 
+                xticklabels=class_names, yticklabels=class_names)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('True')
+    ax.set_title(title)
+    plt.tight_layout()
+    return fig
+
 def main():
     # ====== config ======
     seed = 42
     n_splits = 5
 
-    max_epochs = 50
+    max_epochs = 35
     batch_size = 5
     lr = 1e-4
     weight_decay = 1e-2
+
+    # Focal Loss parameters
+    focal_gamma = 2.0              # Focusing parameter for Focal Loss (higher = more focus on hard examples)
+    use_class_weights = True       # Whether to use class weights in Focal Loss
 
     # early stopping + scheduler
     use_early_stopping = False
@@ -111,7 +162,7 @@ def main():
     min_delta = 1e-4              # val loss 至少下降多少才算提升
     save_by = "val_loss"          # 根据val loss来储存checkpoint
 
-    manifest_path = "/data1/yxinwang/yarong/project/src/data/manifest.csv"
+    manifest_path = "/data1/yxinwang/yarong/project/src/data_handler/manifest.csv"
     ckpt_root = "checkpoints"
 
     # Tensor board log root
@@ -131,7 +182,7 @@ def main():
 
     labels = df["label"].to_numpy().astype(int)
     if labels.min() < 0:
-        raise ValueError("Labels must be >= 0 for CrossEntropyLoss.")
+        raise ValueError("Labels must be >= 0.")
 
     num_classes = int(labels.max()) + 1
     print(f"Total samples: {len(df)} | num_classes: {num_classes}")
@@ -166,8 +217,9 @@ def main():
         writer.add_text("meta/hparams",
                         f"seed={seed}, n_splits={n_splits}, batch_size={batch_size}, "
                         f"lr={lr}, weight_decay={weight_decay}, max_epochs={max_epochs}, "
-                        f"patience={patience}, min_delta={min_delta}, save_by={save_by}"
-                        f"use_early_stopping={use_early_stopping}",
+                        f"patience={patience}, min_delta={min_delta}, save_by={save_by}, "
+                        f"use_early_stopping={use_early_stopping}, "
+                        f"loss=FocalLoss, focal_gamma={focal_gamma}, use_class_weights={use_class_weights}",
                         global_step=0)
         writer.add_text("data/train_class_counts", str(train_counts), global_step=0)
         writer.add_text("data/val_class_counts", str(val_counts), global_step=0)
@@ -177,9 +229,11 @@ def main():
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        # class-weighted CE loss（每折基于 train 的分布算）
-        class_w = _compute_class_weights(train_df["label"].to_numpy().astype(int), num_classes).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_w)
+        # Focal Loss 
+        class_w = None
+        if use_class_weights:
+            class_w = _compute_class_weights(train_df["label"].to_numpy().astype(int), num_classes).to(device)
+        criterion = FocalLoss(gamma=focal_gamma, reduction='mean') #先不叠加class weight 看看结果
 
         # scheduler: val loss 无改善则降 lr
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -205,27 +259,58 @@ def main():
             val_stats = trainer.validate(val_loader)
 
             # 默认 Trainer 返回 {'loss':..., 'acc':...}
-            tr_loss, tr_acc = train_stats.get("loss"), train_stats.get("acc")
-            va_loss, va_acc = val_stats.get("loss"), val_stats.get("acc")
+            tr_loss, tr_acc, tr_bal_acc, tr_y_pred = train_stats.get("loss"), train_stats.get("acc"), train_stats.get("bal_acc"), train_stats.get("y_pred")
+            va_loss, va_acc, va_bal_acc, va_y_pred , va_y_true = val_stats.get("loss"), val_stats.get("acc"), val_stats.get("bal_acc"), val_stats.get("y_pred"), val_stats.get("y_t")
+            tr_cm = train_stats.get("confusion_matrix")
+            va_cm = val_stats.get("confusion_matrix")
             cur_lr = optimizer.param_groups[0]["lr"]
 
             print(
                 f"Fold {fold} | Epoch {epoch:02d} | lr {cur_lr:.2e} | "
-                f"train loss {tr_loss:.4f} acc {tr_acc:.4f} | "
-                f"val loss {va_loss:.4f} acc {va_acc:.4f}"
+                f"train loss {tr_loss:.4f} acc {tr_acc:.4f} bal_acc {tr_bal_acc:.4f} y_pred {tr_y_pred}| "
+                f"val loss {va_loss:.4f} val_acc {va_acc:.4f} val_bal_acc {va_bal_acc:.4f} val_y_pred {va_y_pred} val_y_true{va_y_true}"
             )
+            
+            # Print confusion matrix
+            if va_cm is not None:
+                print(f"\nValidation Confusion Matrix (Epoch {epoch}):")
+                print(va_cm)
+                print()  # Empty line for readability
 
             # Write to tensorboard
             if tr_loss is not None:
                 writer.add_scalar("train/loss", float(tr_loss), epoch)
-            if tr_acc is not None:
-                writer.add_scalar("train/acc", float(tr_acc), epoch)
+            if tr_bal_acc is not None:
+                writer.add_scalar("train/bal_acc", float(tr_bal_acc), epoch)
             if va_loss is not None:
                 writer.add_scalar("val/loss", float(va_loss), epoch)
-            if va_acc is not None:
-                writer.add_scalar("val/acc", float(va_acc), epoch)
+            if va_bal_acc is not None:
+                writer.add_scalar("val/bal_acc", float(va_bal_acc), epoch)
 
             writer.add_scalar("optim/lr", float(cur_lr), epoch)
+            
+            # Visualize confusion matrix in tensorboard
+            if va_cm is not None:
+                class_names = [f"Class {i}" for i in range(num_classes)]
+                # Normalized confusion matrix
+                fig_norm = plot_confusion_matrix(va_cm, class_names=class_names, 
+                                                normalize=True, title=f'Validation Confusion Matrix (Normalized) - Epoch {epoch}')
+                writer.add_figure("confusion_matrix/val_normalized", fig_norm, epoch)
+                plt.close(fig_norm)
+                
+                # Raw confusion matrix
+                fig_raw = plot_confusion_matrix(va_cm, class_names=class_names, 
+                                               normalize=False, title=f'Validation Confusion Matrix (Raw) - Epoch {epoch}')
+                writer.add_figure("confusion_matrix/val_raw", fig_raw, epoch)
+                plt.close(fig_raw)
+            
+            if tr_cm is not None:
+                class_names = [f"Class {i}" for i in range(num_classes)]
+                # Normalized confusion matrix for training
+                fig_norm = plot_confusion_matrix(tr_cm, class_names=class_names, 
+                                                normalize=True, title=f'Train Confusion Matrix (Normalized) - Epoch {epoch}')
+                writer.add_figure("confusion_matrix/train_normalized", fig_norm, epoch)
+                plt.close(fig_norm)
 
             # scheduler step on val loss
             scheduler.step(va_loss)
@@ -246,7 +331,9 @@ def main():
                         "best_val_loss": best_metric if save_by == "val_loss" else None,
                         "best_val_acc": best_metric if save_by != "val_loss" else None,
                         "manifest": manifest_path,
-                        "class_weights": class_w.detach().cpu().numpy().tolist(),
+                        "class_weights": class_w.detach().cpu().numpy().tolist() if class_w is not None else None,
+                        "focal_gamma": focal_gamma,
+                        "use_class_weights": use_class_weights,
                     },
                     best_path
                 )
