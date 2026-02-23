@@ -69,11 +69,13 @@ def make_loaders(train_df, val_df, batch_size=2, num_workers=0):
         train_df["path"].tolist(),
         train_df["label"].tolist(),
         normalize=True,
+        enable_augmentation=True,  # Enable augmentation for training set
     )
     val_ds = MedicalImageDataset(
         val_df["path"].tolist(),
         val_df["label"].tolist(),
         normalize=True,
+        enable_augmentation=False,  # Disable augmentation for validation set
     )
 
     # Sample the data based on label
@@ -152,6 +154,9 @@ def main():
     lr = 1e-4
     weight_decay = 1e-2
 
+    # Parameter for ResNet
+    res_drop = 0.1
+
     # Focal Loss parameters
     focal_gamma = 2.0              # Focusing parameter for Focal Loss (higher = more focus on hard examples)
     use_class_weights = True       # Whether to use class weights in Focal Loss
@@ -187,6 +192,12 @@ def main():
     num_classes = int(labels.max()) + 1
     print(f"Total samples: {len(df)} | num_classes: {num_classes}")
     print("Global class counts:", df["label"].value_counts().sort_index().to_dict())
+    
+    # Show augmented statistics
+    temp_ds = MedicalImageDataset(df["path"].tolist(), df["label"].tolist(), normalize=False)
+    aug_labels = np.array(temp_ds.labels)
+    aug_counts = pd.Series(aug_labels).value_counts().sort_index().to_dict()
+    print(f"After augmentation - Total samples: {len(temp_ds)} | Augmented class counts: {aug_counts}")
 
     # ====== 2) Stratified K-fold ======
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
@@ -219,13 +230,14 @@ def main():
                         f"lr={lr}, weight_decay={weight_decay}, max_epochs={max_epochs}, "
                         f"patience={patience}, min_delta={min_delta}, save_by={save_by}, "
                         f"use_early_stopping={use_early_stopping}, "
-                        f"loss=FocalLoss, focal_gamma={focal_gamma}, use_class_weights={use_class_weights}",
+                        f"loss=FocalLoss, focal_gamma={focal_gamma}, use_class_weights={use_class_weights}"
+                        f"res_drop={res_drop}",
                         global_step=0)
         writer.add_text("data/train_class_counts", str(train_counts), global_step=0)
         writer.add_text("data/val_class_counts", str(val_counts), global_step=0)
 
         # ====== 3) model/optim/criterion/trainer ======
-        model = Basic3DCNN(num_classes=num_classes).to(device)
+        model = Basic3DCNN(num_classes=num_classes, res_drop = res_drop).to(device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -267,8 +279,8 @@ def main():
 
             print(
                 f"Fold {fold} | Epoch {epoch:02d} | lr {cur_lr:.2e} | "
-                f"train loss {tr_loss:.4f} acc {tr_acc:.4f} bal_acc {tr_bal_acc:.4f} y_pred {tr_y_pred}| "
-                f"val loss {va_loss:.4f} val_acc {va_acc:.4f} val_bal_acc {va_bal_acc:.4f} val_y_pred {va_y_pred} val_y_true{va_y_true}"
+                f"train loss {tr_loss:.4f} acc {tr_acc:.4f} bal_acc {tr_bal_acc:.4f}| "
+                f"val loss {va_loss:.4f} val_acc {va_acc:.4f} val_bal_acc {va_bal_acc:.4f}"
             )
             
             # Print confusion matrix
