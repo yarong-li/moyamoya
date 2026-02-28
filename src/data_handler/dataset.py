@@ -13,13 +13,19 @@ class MedicalImageDataset(Dataset):
         for path, label in zip(image_paths, labels):
             # Add original sample
             self.image_paths.append(path)
-            self.labels.append(label)
+            # ----- Multi-class (original): uncomment to restore multi-class -----
+            # self.labels.append(label)
+            # ----- Binary classification (label<=1 vs label>1): 0 = label<=1, 1 = label>1 -----
+            self.labels.append(1 if label > 1 else 0)
             self.flip_flags.append(False)
             
             # Add flipped version for labels > 1 (only if augmentation is enabled)
             if enable_augmentation and label > 1:
                 self.image_paths.append(path)
-                self.labels.append(label)
+                # ----- Multi-class (original) -----
+                # self.labels.append(label)
+                # ----- Binary -----
+                self.labels.append(1 if label > 1 else 0)
                 self.flip_flags.append(True)
         
         self.normalize = normalize

@@ -7,9 +7,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import balanced_accuracy_score
 
 from src.data_handler.dataset import MedicalImageDataset
 from src.models.cnn_3d import Basic3DCNN
+from src.models.vit_3d import VisionTransformer3D
 from src.training.trainer import Trainer
 from src.training.losses import FocalLoss
 
@@ -78,8 +80,8 @@ def make_loaders(train_df, val_df, batch_size=2, num_workers=0):
         enable_augmentation=False,  # Disable augmentation for validation set
     )
 
-    # Sample the data based on label
-    train_labels = train_df["label"].to_numpy().astype(int)
+    # Sample the data based on label (use dataset labels after augmentation/down-sampling)
+    train_labels = np.array(train_ds.labels, dtype=int)
     class_counts = np.bincount(train_labels, minlength=int(train_labels.max()) + 1)
     class_weights = 1.0 / np.maximum(class_counts, 1)          # 每类权重 ~ 1/count
     sample_weights = class_weights[train_labels]               
@@ -154,8 +156,20 @@ def main():
     lr = 1e-4
     weight_decay = 1e-2
 
-    # Parameter for ResNet
+    # Model: "cnn" (Basic3DCNN) or "vit" (VisionTransformer3D)
+    model_name = "vit"
+
+    # Parameter for CNN (ResNet / Basic3DCNN)
     res_drop = 0.1
+
+    # Parameters for ViT (used when model_name == "vit")
+    vit_spatial_size = (96, 112, 96)
+    vit_patch_size = (16, 16, 16)
+    vit_embed_dim = 384
+    vit_depth = 6
+    vit_num_heads = 6
+    vit_mlp_ratio = 4.0
+    vit_dropout = 0.1
 
     # Focal Loss parameters
     focal_gamma = 2.0              # Focusing parameter for Focal Loss (higher = more focus on hard examples)
@@ -169,6 +183,9 @@ def main():
 
     manifest_path = "/data1/yxinwang/yarong/project/src/data_handler/manifest.csv"
     ckpt_root = "checkpoints"
+
+    # ----- Binary classification (label<=1 vs label>1): set False to restore multi-class -----
+    BINARY_CLASSIFICATION = True
 
     # Tensor board log root
     tb_root = "runs"  # tensorboard --logdir runs
@@ -189,9 +206,20 @@ def main():
     if labels.min() < 0:
         raise ValueError("Labels must be >= 0.")
 
-    num_classes = int(labels.max()) + 1
-    print(f"Total samples: {len(df)} | num_classes: {num_classes}")
-    print("Global class counts:", df["label"].value_counts().sort_index().to_dict())
+    # ----- Multi-class (original): uncomment to restore multi-class -----
+    # num_classes = int(labels.max()) + 1
+    # print(f"Total samples: {len(df)} | num_classes: {num_classes}")
+    # print("Global class counts:", df["label"].value_counts().sort_index().to_dict())
+    # ----- Binary classification (label<=1 vs label>1) -----
+    if BINARY_CLASSIFICATION:
+        num_classes = 2
+        binary_labels = (labels > 1).astype(int)  # 0 = label<=1, 1 = label>1
+        print(f"Total samples: {len(df)} | num_classes: {num_classes} (binary: label<=1 vs label>1)")
+        print("Global class counts (binary):", pd.Series(binary_labels).value_counts().sort_index().to_dict())
+    else:
+        num_classes = int(labels.max()) + 1
+        print(f"Total samples: {len(df)} | num_classes: {num_classes}")
+        print("Global class counts:", df["label"].value_counts().sort_index().to_dict())
     
     # Show augmented statistics
     temp_ds = MedicalImageDataset(df["path"].tolist(), df["label"].tolist(), normalize=False)
@@ -201,9 +229,15 @@ def main():
 
     # ====== 2) Stratified K-fold ======
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    # For binary: stratify by binary labels so train/val have similar 0/1 ratio
+    stratify_labels = (labels > 1).astype(int) if BINARY_CLASSIFICATION else labels
 
     fold_results = []
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df["path"].to_numpy(), labels), start=1):
+    all_val_y_true = []
+    all_val_y_pred = []
+    # ----- Multi-class (original): use labels instead of stratify_labels -----
+    # for fold, (train_idx, val_idx) in enumerate(skf.split(df["path"].to_numpy(), labels), start=1):
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df["path"].to_numpy(), stratify_labels), start=1):
         print("\n" + "=" * 60)
         print(f"Fold {fold}/{n_splits}")
 
@@ -230,21 +264,38 @@ def main():
                         f"lr={lr}, weight_decay={weight_decay}, max_epochs={max_epochs}, "
                         f"patience={patience}, min_delta={min_delta}, save_by={save_by}, "
                         f"use_early_stopping={use_early_stopping}, "
-                        f"loss=FocalLoss, focal_gamma={focal_gamma}, use_class_weights={use_class_weights}"
-                        f"res_drop={res_drop}",
+                        f"loss=FocalLoss, focal_gamma={focal_gamma}, use_class_weights={use_class_weights}, "
+                        f"model_name={model_name}, res_drop={res_drop}, BINARY_CLASSIFICATION={BINARY_CLASSIFICATION}",
                         global_step=0)
         writer.add_text("data/train_class_counts", str(train_counts), global_step=0)
         writer.add_text("data/val_class_counts", str(val_counts), global_step=0)
 
         # ====== 3) model/optim/criterion/trainer ======
-        model = Basic3DCNN(num_classes=num_classes, res_drop = res_drop).to(device)
+        if model_name == "vit":
+            model = VisionTransformer3D(
+                num_classes=num_classes,
+                in_channels=1,
+                spatial_size=vit_spatial_size,
+                patch_size=vit_patch_size,
+                embed_dim=vit_embed_dim,
+                depth=vit_depth,
+                num_heads=vit_num_heads,
+                mlp_ratio=vit_mlp_ratio,
+                dropout=vit_dropout,
+            ).to(device)
+        else:
+            model = Basic3DCNN(num_classes=num_classes, res_drop=res_drop).to(device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         # Focal Loss 
         class_w = None
         if use_class_weights:
-            class_w = _compute_class_weights(train_df["label"].to_numpy().astype(int), num_classes).to(device)
+            # ----- Multi-class (original): use original train labels -----
+            # class_w = _compute_class_weights(train_df["label"].to_numpy().astype(int), num_classes).to(device)
+            # ----- Binary: use binary train labels (0/1) -----
+            train_labels_for_w = (train_df["label"].to_numpy() > 1).astype(int) if BINARY_CLASSIFICATION else train_df["label"].to_numpy().astype(int)
+            class_w = _compute_class_weights(train_labels_for_w, num_classes).to(device)
         criterion = FocalLoss(gamma=focal_gamma, reduction='mean') #先不叠加class weight 看看结果
 
         # scheduler: val loss 无改善则降 lr
@@ -303,7 +354,8 @@ def main():
             
             # Visualize confusion matrix in tensorboard
             if va_cm is not None:
-                class_names = [f"Class {i}" for i in range(num_classes)]
+                # ----- Binary: more descriptive names -----
+                class_names = (["label<=1", "label>1"] if BINARY_CLASSIFICATION else [f"Class {i}" for i in range(num_classes)])
                 # Normalized confusion matrix
                 fig_norm = plot_confusion_matrix(va_cm, class_names=class_names, 
                                                 normalize=True, title=f'Validation Confusion Matrix (Normalized) - Epoch {epoch}')
@@ -317,7 +369,7 @@ def main():
                 plt.close(fig_raw)
             
             if tr_cm is not None:
-                class_names = [f"Class {i}" for i in range(num_classes)]
+                class_names = (["label<=1", "label>1"] if BINARY_CLASSIFICATION else [f"Class {i}" for i in range(num_classes)])
                 # Normalized confusion matrix for training
                 fig_norm = plot_confusion_matrix(tr_cm, class_names=class_names, 
                                                 normalize=True, title=f'Train Confusion Matrix (Normalized) - Epoch {epoch}')
@@ -334,21 +386,28 @@ def main():
                 best_metric = va_loss if save_by == "val_loss" else va_acc
                 best_epoch = epoch
                 no_improve = 0
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "num_classes": num_classes,
-                        "fold": fold,
-                        "epoch": epoch,
-                        "best_val_loss": best_metric if save_by == "val_loss" else None,
-                        "best_val_acc": best_metric if save_by != "val_loss" else None,
-                        "manifest": manifest_path,
-                        "class_weights": class_w.detach().cpu().numpy().tolist() if class_w is not None else None,
-                        "focal_gamma": focal_gamma,
-                        "use_class_weights": use_class_weights,
-                    },
-                    best_path
-                )
+                ckpt = {
+                    "model": model.state_dict(),
+                    "num_classes": num_classes,
+                    "fold": fold,
+                    "epoch": epoch,
+                    "best_val_loss": best_metric if save_by == "val_loss" else None,
+                    "best_val_acc": best_metric if save_by != "val_loss" else None,
+                    "manifest": manifest_path,
+                    "class_weights": class_w.detach().cpu().numpy().tolist() if class_w is not None else None,
+                    "focal_gamma": focal_gamma,
+                    "use_class_weights": use_class_weights,
+                    "model_name": model_name,
+                }
+                if model_name == "vit":
+                    ckpt["vit_spatial_size"] = vit_spatial_size
+                    ckpt["vit_patch_size"] = vit_patch_size
+                    ckpt["vit_embed_dim"] = vit_embed_dim
+                    ckpt["vit_depth"] = vit_depth
+                    ckpt["vit_num_heads"] = vit_num_heads
+                    ckpt["vit_mlp_ratio"] = vit_mlp_ratio
+                    ckpt["vit_dropout"] = vit_dropout
+                torch.save(ckpt, best_path)
                 # Write to tensorboard
                 if save_by == "val_loss":
                     writer.add_scalar("best/val_loss", float(best_metric), epoch)
@@ -365,6 +424,11 @@ def main():
         fold_results.append({"fold": fold, "best_epoch": best_epoch, "best_val_loss": best_metric, "ckpt": best_path})
         print(f"✅ Fold {fold} best at epoch {best_epoch} | best val loss: {best_metric:.4f} | saved: {best_path}")
 
+        # 收集该 fold 最后一次验证的预测和标签（用于整体 balanced accuracy）
+        if va_y_true is not None and va_y_pred is not None:
+            all_val_y_true.append(np.array(va_y_true))
+            all_val_y_pred.append(np.array(va_y_pred))
+
         # Close tensor board
         writer.close()
     # ====== 5) summary ======
@@ -372,6 +436,13 @@ def main():
     losses = [r["best_val_loss"] for r in fold_results]
     print("CV results:", fold_results)
     print(f"Mean best val loss: {np.mean(losses):.4f} ± {np.std(losses):.4f}")
+
+    # ====== 6) overall balanced accuracy over whole dataset ======
+    if len(all_val_y_true) > 0:
+        y_true_all = np.concatenate(all_val_y_true)
+        y_pred_all = np.concatenate(all_val_y_pred)
+        overall_bal_acc = balanced_accuracy_score(y_true_all, y_pred_all)
+        print(f"Overall balanced accuracy over all validation splits: {overall_bal_acc:.4f}")
 
 
 if __name__ == "__main__":
