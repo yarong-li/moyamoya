@@ -10,8 +10,10 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score
 
 from src.data_handler.dataset import MedicalImageDataset
+from src.data_handler.transforms import build_medvae_transform
 from src.models.cnn_3d import Basic3DCNN
 from src.models.vit_3d import VisionTransformer3D
+from src.models.medvae_fixed_encoder import MedVAEFixedEncoderClassifier
 from src.training.trainer import Trainer
 from src.training.losses import FocalLoss
 
@@ -66,18 +68,49 @@ def sanity_check_manifest(df: pd.DataFrame):
     return df
 
 
-def make_loaders(train_df, val_df, batch_size=2, num_workers=0):
+def downsample_label_leq_one(train_df: pd.DataFrame, drop_rate: float) -> pd.DataFrame:
+    """Randomly drop samples with label<=1 by probability drop_rate (train only)."""
+    if drop_rate <= 0:
+        return train_df
+    m = (train_df["label"].to_numpy() <= 1)
+    keep = np.ones(len(train_df), dtype=bool)
+    keep[m] = (np.random.rand(int(m.sum())) >= float(drop_rate))
+    return train_df.loc[keep].reset_index(drop=True)
+
+
+def make_loaders(
+    train_df,
+    val_df,
+    batch_size=2,
+    num_workers=0,
+    transform_type="default",
+    medvae_model_name="medvae_4_1_3d",
+    medvae_modality="mri",
+):
+    medvae_transform = None
+    return_dict = False
+    if transform_type == "medvae":
+        medvae_transform = build_medvae_transform(
+            model_name=medvae_model_name,
+            modality=medvae_modality,
+        )
+        return_dict = True
+
     train_ds = MedicalImageDataset(
         train_df["path"].tolist(),
         train_df["label"].tolist(),
         normalize=True,
         enable_augmentation=True,  # Enable augmentation for training set
+        transform=medvae_transform,
+        return_dict=return_dict,
     )
     val_ds = MedicalImageDataset(
         val_df["path"].tolist(),
         val_df["label"].tolist(),
         normalize=True,
         enable_augmentation=False,  # Disable augmentation for validation set
+        transform=medvae_transform,
+        return_dict=return_dict,
     )
 
     # Sample the data based on label (use dataset labels after augmentation/down-sampling)
@@ -156,8 +189,8 @@ def main():
     lr = 1e-4
     weight_decay = 1e-2
 
-    # Model: "cnn" (Basic3DCNN) or "vit" (VisionTransformer3D)
-    model_name = "vit"
+    # Model: "cnn" (Basic3DCNN) / "vit" (VisionTransformer3D) / "medvae_fixed" (Frozen MedVAE encoder + MLP head)
+    model_name = "medvae_fixed"
 
     # Parameter for CNN (ResNet / Basic3DCNN)
     res_drop = 0.1
@@ -170,6 +203,17 @@ def main():
     vit_num_heads = 6
     vit_mlp_ratio = 4.0
     vit_dropout = 0.1
+
+    # Parameters for MedVAE fixed-encoder baseline (used when model_name == "medvae_fixed")
+    medvae_model_name = "medvae_4_1_3d"   # or "medvae_8_1_3d"
+    medvae_modality = "mri"
+    medvae_existing_weight = None         # optional: local ckpt path to avoid HF download
+    medvae_state_dict = True              # True if ckpt is a Lightning ckpt with ["state_dict"]
+    # Kept for compatibility with old fixed-encoder wrapper.
+    # Current implementation calls MVAE.encode(...), where this flag is not used.
+    medvae_sample_posterior = False
+    medvae_head_dropout = 0.2
+    medvae_head_hidden_mult = 2
 
     # Focal Loss parameters
     focal_gamma = 2.0              # Focusing parameter for Focal Loss (higher = more focus on hard examples)
@@ -186,10 +230,15 @@ def main():
 
     # ----- Binary classification (label<=1 vs label>1): set False to restore multi-class -----
     BINARY_CLASSIFICATION = True
+    # Downsample training samples with label<=1 (validation is NEVER downsampled)
+    label_leq_one_drop_rate = 0
 
     # Tensor board log root
     tb_root = "runs"  # tensorboard --logdir runs
     run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Validation predictions: single CSV with columns fold, y_true, y_pred
+    val_pred_dir = "val_predictions"
+    val_pred_path = os.path.join(val_pred_dir, run_name + ".csv")
 
     # ====== setup ======
     set_seed(seed)
@@ -197,6 +246,7 @@ def main():
     print("Device:", device)
     os.makedirs(ckpt_root, exist_ok=True)
     os.makedirs(tb_root, exist_ok=True)
+    os.makedirs(val_pred_dir, exist_ok=True)
 
     # ====== 1) load manifest ======
     df = pd.read_csv(manifest_path)
@@ -243,6 +293,7 @@ def main():
 
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df   = df.iloc[val_idx].reset_index(drop=True)
+        train_df = downsample_label_leq_one(train_df, label_leq_one_drop_rate)
 
         assert set(train_df["path"]).isdisjoint(set(val_df["path"])), "Train/val overlap detected!"
 
@@ -252,7 +303,13 @@ def main():
         print("Val   class counts:", val_counts)
 
         train_loader, val_loader = make_loaders(
-            train_df, val_df, batch_size=batch_size, num_workers=0
+            train_df,
+            val_df,
+            batch_size=batch_size,
+            num_workers=0,
+            transform_type=("medvae" if model_name == "medvae_fixed" else "default"),
+            medvae_model_name=medvae_model_name,
+            medvae_modality=medvae_modality,
         )
 
         tb_logdir = os.path.join(tb_root, run_name, f"fold_{fold}")
@@ -282,6 +339,17 @@ def main():
                 num_heads=vit_num_heads,
                 mlp_ratio=vit_mlp_ratio,
                 dropout=vit_dropout,
+            ).to(device)
+        elif model_name == "medvae_fixed":
+            model = MedVAEFixedEncoderClassifier(
+                num_classes=num_classes,
+                medvae_model_name=medvae_model_name,
+                modality=medvae_modality,
+                existing_weight=medvae_existing_weight,
+                state_dict=medvae_state_dict,
+                sample_posterior=medvae_sample_posterior,
+                head_dropout=medvae_head_dropout,
+                head_hidden_mult=medvae_head_hidden_mult,
             ).to(device)
         else:
             model = Basic3DCNN(num_classes=num_classes, res_drop=res_drop).to(device)
@@ -314,6 +382,8 @@ def main():
         best_metric = float("inf") if save_by == "val_loss" else -1.0
         best_epoch = -1
         no_improve = 0
+        best_va_y_true = None
+        best_va_y_pred = None
 
         best_path = os.path.join(ckpt_root, f"fold_{fold}_best.pt")
 
@@ -408,6 +478,10 @@ def main():
                     ckpt["vit_mlp_ratio"] = vit_mlp_ratio
                     ckpt["vit_dropout"] = vit_dropout
                 torch.save(ckpt, best_path)
+                # 保存当前 best 对应的验证预测/标签，用于后续 CSV 与 overall balanced accuracy
+                if va_y_true is not None and va_y_pred is not None:
+                    best_va_y_true = list(va_y_true)
+                    best_va_y_pred = list(va_y_pred)
                 # Write to tensorboard
                 if save_by == "val_loss":
                     writer.add_scalar("best/val_loss", float(best_metric), epoch)
@@ -424,10 +498,15 @@ def main():
         fold_results.append({"fold": fold, "best_epoch": best_epoch, "best_val_loss": best_metric, "ckpt": best_path})
         print(f"✅ Fold {fold} best at epoch {best_epoch} | best val loss: {best_metric:.4f} | saved: {best_path}")
 
-        # 收集该 fold 最后一次验证的预测和标签（用于整体 balanced accuracy）
-        if va_y_true is not None and va_y_pred is not None:
-            all_val_y_true.append(np.array(va_y_true))
-            all_val_y_pred.append(np.array(va_y_pred))
+        # 收集该 fold 最佳验证时的预测和标签（用于整体 balanced accuracy），并追加到单 CSV
+        if best_va_y_true is not None and best_va_y_pred is not None:
+            all_val_y_true.append(np.array(best_va_y_true))
+            all_val_y_pred.append(np.array(best_va_y_pred))
+            pd.DataFrame({
+                "fold": fold,
+                "y_true": best_va_y_true,
+                "y_pred": best_va_y_pred,
+            }).to_csv(val_pred_path, mode="a", header=(fold == 1), index=False)
 
         # Close tensor board
         writer.close()

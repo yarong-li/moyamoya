@@ -20,3 +20,10 @@ training.log
 # 测试脚本
 src/training/test.ipynb
 src/note.ipynb
+
+# MedVAE code (因为暂时没有更改所以不上传)
+MedVAE/
+MedVAE_test.ipynb
+
+# validation set result
+val_predictions/

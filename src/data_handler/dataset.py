@@ -2,9 +2,19 @@ import torch
 from torch.utils.data import Dataset
 import nibabel as nib
 import numpy as np
+from typing import Callable, Optional
 
 class MedicalImageDataset(Dataset):
-    def __init__(self, image_paths, labels, normalize=False, clip_percentiles=(1, 99), enable_augmentation=True):
+    def __init__(
+        self,
+        image_paths,
+        labels,
+        normalize=False,
+        clip_percentiles=(1, 99),
+        enable_augmentation=True,
+        transform: Optional[Callable[[str], torch.Tensor]] = None,
+        return_dict: bool = False,
+    ):
         # Data augmentation: duplicate samples with label > 1 and mark for flipping
         self.image_paths = []
         self.labels = []
@@ -30,6 +40,8 @@ class MedicalImageDataset(Dataset):
         
         self.normalize = normalize
         self.clip_percentiles = clip_percentiles
+        self.transform = transform
+        self.return_dict = return_dict
 
     def __len__(self):
         return len(self.image_paths)
@@ -41,27 +53,35 @@ class MedicalImageDataset(Dataset):
         return x.astype(np.float32, copy=False)
 
     def __getitem__(self, idx):
-        path = self.image_paths[idx]
+        fpath = self.image_paths[idx]
         label = self.labels[idx]
         should_flip = self.flip_flags[idx]
 
-        # 1 load + canonical orientation (RAS)
-        # nii = nib.as_closest_canonical(nib.load(path))
-        nii = nib.load(path)
-        x = nii.get_fdata(dtype=np.float32)  # (D,H,W)
+        # For MedVAE path-based transforms, image generation happens here.
+        if self.transform is not None:
+            x = self.transform(fpath)
+            if not isinstance(x, torch.Tensor):
+                raise TypeError("transform must return torch.Tensor")
+            x = x.to(dtype=torch.float32)
+        else:
+            # 1 load + canonical orientation (RAS)
+            # nii = nib.as_closest_canonical(nib.load(fpath))
+            nii = nib.load(fpath)
+            x = nii.get_fdata(dtype=np.float32)  # (D,H,W)
 
-        # 2 optional normalize
-        if self.normalize:
-            x = self._normalize(x)
+            # 2 optional normalize
+            if self.normalize:
+                x = self._normalize(x)
 
-        # 3 data augmentation: flip horizontally if marked
+            # 3 to tensor: [C, D, H, W]
+            x = torch.from_numpy(x).unsqueeze(0)  # float32
+
+        # Data augmentation: flip on tensor domain to support all transforms.
         if should_flip:
-            x = np.flip(x, axis=2).copy()  # flip along width dimension and create copy to avoid negative strides
+            x = torch.flip(x, dims=(-1,))
 
-        # 4 to tensor: [C, D, H, W]
-        x = torch.from_numpy(x).unsqueeze(0)  # float32
-
-        # 5 classification label: scalar long
         y = torch.tensor(label, dtype=torch.long)
 
+        if self.return_dict:
+            return {"image": x, "label": y}
         return x, y

@@ -46,7 +46,8 @@ class Trainer:
         all_preds = []
         all_targets = []
 
-        for x, y in loader:
+        for batch in loader:
+            x, y = self._unpack_batch(batch)
             x = x.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
 
@@ -78,7 +79,8 @@ class Trainer:
         all_preds = []
         all_targets = []
 
-        for x, y in loader:
+        for batch in loader:
+            x, y = self._unpack_batch(batch)
             x = x.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
 
@@ -98,3 +100,17 @@ class Trainer:
         out = {"loss": total_loss / max(len(y_true), 1)}
         out.update(self._compute_metrics(y_true, y_pred, num_classes=self.num_classes))
         return out
+
+    @staticmethod
+    def _unpack_batch(batch):
+        if isinstance(batch, dict):
+            if "image" in batch and "label" in batch:
+                return batch["image"], batch["label"]
+            if "img" in batch and "lbl" in batch:
+                return batch["img"], batch["lbl"]
+            raise KeyError("Batch dict must contain keys ('image','label') or ('img','lbl').")
+
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            return batch[0], batch[1]
+
+        raise TypeError("Unsupported batch format. Expect tuple/list or dict batch.")

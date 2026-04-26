@@ -42,16 +42,16 @@ class Basic3DCNN(nn.Module):
 
         self.features = nn.Sequential(
             down_block(in_channels, 16),
-            # ResBlock3D(16, dropout=res_drop),
+            ResBlock3D(16, dropout=res_drop),
 
             down_block(16, 32),
-            # ResBlock3D(32, dropout=res_drop),
+            ResBlock3D(32, dropout=res_drop),
 
             down_block(32, 64),
-            # ResBlock3D(64, dropout=res_drop),
+            ResBlock3D(64, dropout=res_drop),
 
             down_block(64, 128),
-            # ResBlock3D(128, dropout=res_drop),
+            ResBlock3D(128, dropout=res_drop),
         )
 
         self.pool = nn.AdaptiveAvgPool3d(1)  # -> [B, C, 1,1,1]
