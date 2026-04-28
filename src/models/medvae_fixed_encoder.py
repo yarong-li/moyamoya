@@ -47,7 +47,7 @@ class MedVAEFixedEncoderClassifier(nn.Module):
         super().__init__()
 
         _ensure_medvae_importable()
-        from medvae import MVAE  # type: ignore
+        from medvae import MVAE 
 
         self.mvae = MVAE(model_name=medvae_model_name, modality=modality)
         if existing_weight is not None:
