@@ -1,22 +1,9 @@
-import os
-import sys
 from typing import Callable, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
-
-def _ensure_medvae_importable():
-    try:
-        import medvae  # noqa: F401
-        return
-    except Exception:
-        pass
-
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    local_medvae_root = os.path.join(project_root, "MedVAE")
-    if os.path.isdir(local_medvae_root) and local_medvae_root not in sys.path:
-        sys.path.insert(0, local_medvae_root)
+from src.medvae_local import get_local_mvae_class
 
 
 def build_medvae_transform(
@@ -28,8 +15,7 @@ def build_medvae_transform(
     Build a path-based transform for MedVAE that calls MVAE.apply_transform(fpath).
     Output shape per sample: [1, D, H, W], value range expected by MedVAE: [-1, 1].
     """
-    _ensure_medvae_importable()
-    from medvae import MVAE  # type: ignore
+    MVAE = get_local_mvae_class()
 
     mvae = MVAE(model_name=model_name, modality=modality)
 

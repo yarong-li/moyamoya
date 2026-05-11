@@ -1,25 +1,9 @@
-import os
-import sys
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
-
-def _ensure_medvae_importable():
-    """
-    Make local ./MedVAE/ importable as `medvae` without requiring installation.
-    """
-    try:
-        import medvae  # noqa: F401
-        return
-    except Exception:
-        pass
-
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    local_medvae_root = os.path.join(project_root, "MedVAE")
-    if os.path.isdir(local_medvae_root) and local_medvae_root not in sys.path:
-        sys.path.insert(0, local_medvae_root)
+from src.medvae_local import get_local_mvae_class
 
 
 class MedVAEFixedEncoderClassifier(nn.Module):
@@ -46,8 +30,7 @@ class MedVAEFixedEncoderClassifier(nn.Module):
     ):
         super().__init__()
 
-        _ensure_medvae_importable()
-        from medvae import MVAE 
+        MVAE = get_local_mvae_class()
 
         self.mvae = MVAE(model_name=medvae_model_name, modality=modality)
         if existing_weight is not None:
@@ -91,4 +74,3 @@ class MedVAEFixedEncoderClassifier(nn.Module):
         feat = self.pool(latent)         # [B, C, 1, 1, 1]
         logits = self.head(feat)         # [B, num_classes]
         return logits
-

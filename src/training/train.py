@@ -22,6 +22,11 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+ALLOWED_IMAGE_TYPES = {
+    "CBF_Single_Delay_Pre_Diamox_standard_nonlin",
+    "T1_to_MNI_nonlin",
+}
+
 
 def get_device():
     if torch.cuda.is_available():
@@ -66,6 +71,49 @@ def sanity_check_manifest(df: pd.DataFrame):
         raise ValueError("Duplicate paths found in manifest.")
 
     return df
+
+
+def build_single_image_type_manifest(
+    patients_csv_path: str,
+    patient_images_csv_path: str,
+    selected_image_type: str,
+) -> pd.DataFrame:
+    if selected_image_type not in ALLOWED_IMAGE_TYPES:
+        raise ValueError(
+            f"selected_image_type must be one of {sorted(ALLOWED_IMAGE_TYPES)}, "
+            f"got {selected_image_type!r}."
+        )
+
+    patients_df = pd.read_csv(patients_csv_path)
+    images_df = pd.read_csv(patient_images_csv_path)
+
+    required_patients_cols = {"patient_id", "label"}
+    required_images_cols = {"patient_id", "image_type", "path"}
+    missing_patients_cols = required_patients_cols - set(patients_df.columns)
+    missing_images_cols = required_images_cols - set(images_df.columns)
+    if missing_patients_cols:
+        raise ValueError(f"patients.csv missing columns: {missing_patients_cols}")
+    if missing_images_cols:
+        raise ValueError(f"patient_images.csv missing columns: {missing_images_cols}")
+
+    selected_images_df = images_df[images_df["image_type"] == selected_image_type].copy()
+    if selected_images_df.empty:
+        raise ValueError(f"No rows found for image_type={selected_image_type!r} in patient_images.csv")
+
+    # If one patient has multiple paths for the same image type, keep first deterministic path.
+    selected_images_df = (
+        selected_images_df.sort_values(["patient_id", "path"])
+        .drop_duplicates(subset=["patient_id"], keep="first")
+    )
+
+    merged_df = patients_df.merge(
+        selected_images_df[["patient_id", "path"]],
+        on="patient_id",
+        how="inner",
+    )
+    merged_df = merged_df[["path", "label"]].copy()
+    merged_df["label"] = merged_df["label"].astype(int)
+    return merged_df
 
 
 def downsample_label_leq_one(train_df: pd.DataFrame, drop_rate: float) -> pd.DataFrame:
@@ -184,7 +232,7 @@ def main():
     seed = 42
     n_splits = 5
 
-    max_epochs = 35
+    max_epochs = 35 # 50 for MedVAE 35 for others
     batch_size = 5
     lr = 1e-4
     weight_decay = 1e-2
@@ -225,7 +273,9 @@ def main():
     min_delta = 1e-4              # val loss 至少下降多少才算提升
     save_by = "val_loss"          # 根据val loss来储存checkpoint
 
-    manifest_path = "/data1/yxinwang/yarong/project/src/data_handler/manifest.csv"
+    patients_csv_path = "/data1/yxinwang/yarong/project/src/data_handler/patients.csv"
+    patient_images_csv_path = "/data1/yxinwang/yarong/project/src/data_handler/patient_images.csv"
+    selected_image_type = "T1_to_MNI_nonlin"
     ckpt_root = "checkpoints"
 
     # ----- Binary classification (label<=1 vs label>1): set False to restore multi-class -----
@@ -248,8 +298,12 @@ def main():
     os.makedirs(tb_root, exist_ok=True)
     os.makedirs(val_pred_dir, exist_ok=True)
 
-    # ====== 1) load manifest ======
-    df = pd.read_csv(manifest_path)
+    # ====== 1) load selected image type manifest ======
+    df = build_single_image_type_manifest(
+        patients_csv_path=patients_csv_path,
+        patient_images_csv_path=patient_images_csv_path,
+        selected_image_type=selected_image_type,
+    )
     df = sanity_check_manifest(df)
 
     labels = df["label"].to_numpy().astype(int)
@@ -322,7 +376,8 @@ def main():
                         f"patience={patience}, min_delta={min_delta}, save_by={save_by}, "
                         f"use_early_stopping={use_early_stopping}, "
                         f"loss=FocalLoss, focal_gamma={focal_gamma}, use_class_weights={use_class_weights}, "
-                        f"model_name={model_name}, res_drop={res_drop}, BINARY_CLASSIFICATION={BINARY_CLASSIFICATION}",
+                        f"model_name={model_name}, res_drop={res_drop}, BINARY_CLASSIFICATION={BINARY_CLASSIFICATION}, "
+                        f"selected_image_type={selected_image_type}",
                         global_step=0)
         writer.add_text("data/train_class_counts", str(train_counts), global_step=0)
         writer.add_text("data/val_class_counts", str(val_counts), global_step=0)
@@ -463,7 +518,7 @@ def main():
                     "epoch": epoch,
                     "best_val_loss": best_metric if save_by == "val_loss" else None,
                     "best_val_acc": best_metric if save_by != "val_loss" else None,
-                    "manifest": manifest_path,
+                    "manifest": f"{patients_csv_path} + {patient_images_csv_path} ({selected_image_type})",
                     "class_weights": class_w.detach().cpu().numpy().tolist() if class_w is not None else None,
                     "focal_gamma": focal_gamma,
                     "use_class_weights": use_class_weights,
